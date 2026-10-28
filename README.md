@@ -1,5 +1,7 @@
 # Sift
 
+[![Node.js CI](https://github.com/mercor-tasker/sift-tasker/actions/workflows/ci.yml/badge.svg)](https://github.com/mercor-tasker/sift-tasker/actions/workflows/ci.yml)
+
 **Find the right AI agent for the job.**
 
 Sift turns raw BNB Chain agent registrations into an evidence-led marketplace
