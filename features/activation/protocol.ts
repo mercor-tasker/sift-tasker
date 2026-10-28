@@ -1,0 +1,785 @@
+import { decodePaymentResponseHeader } from "@x402/core/http";
+import { getAddress, isAddress, isHex, type Address, type Hex } from "viem";
+import { z } from "zod";
+
+import type { Json } from "@/lib/db/database.types";
+import type { HostResolver } from "@/lib/indexer/metadata/url-safety";
+import {
+  ActivationRemoteError,
+  parseJsonBody,
+  parseJsonOrSse,
+  requestActivationService,
+} from "@/features/activation/remote";
+import {
+  parseBnbX402Challenge,
+  validateX402PaymentPayload,
+  x402OptionsFromChallenge,
+  x402PaymentHeader,
+  type BnbX402PaymentPayload,
+  type X402OptionPreference,
+} from "@/features/activation/x402";
+
+const jsonRpcEnvelopeSchema = z.object({
+  error: z.unknown().optional(),
+  id: z.union([z.string(), z.number(), z.null()]).optional(),
+  jsonrpc: z.literal("2.0"),
+  result: z.unknown().optional(),
+});
+
+const mcpToolSchema = z.object({
+  annotations: z
+    .object({
+      destructiveHint: z.boolean().optional(),
+      idempotentHint: z.boolean().optional(),
+      openWorldHint: z.boolean().optional(),
+      readOnlyHint: z.boolean().optional(),
+    })
+    .loose()
+    .optional(),
+  description: z.string().max(1_000).optional(),
+  inputSchema: z.record(z.string(), z.unknown()).optional(),
+  name: z.string().trim().min(1).max(128),
+});
+
+const mcpToolsResultSchema = z.object({
+  tools: z.array(mcpToolSchema).max(100),
+});
+
+const a2aCardSchema = z
+  .object({
+    description: z.string().max(2_000).optional(),
+    name: z.string().trim().min(1).max(256),
+    registrations: z
+      .array(
+        z
+          .object({
+            agentId: z.union([
+              z.number().int().nonnegative().safe(),
+              z.string().regex(/^(0|[1-9][0-9]{0,77})$/),
+            ]),
+            agentRegistry: z.string().trim().min(1).max(256),
+          })
+          .loose(),
+      )
+      .max(100)
+      .optional(),
+    skills: z
+      .array(
+        z
+          .object({
+            description: z.string().max(1_000).optional(),
+            id: z.string().trim().min(1).max(128),
+            name: z.string().trim().min(1).max(256),
+          })
+          .loose(),
+      )
+      .max(100)
+      .optional(),
+    url: z.url().optional(),
+  })
+  .loose();
+
+function json(value: unknown): Json {
+  return JSON.parse(JSON.stringify(value)) as Json;
+}
+
+function parseRpcResult(value: unknown): unknown {
+  const envelope = jsonRpcEnvelopeSchema.parse(value);
+  if (envelope.error !== undefined || envelope.result === undefined) {
+    throw new ActivationRemoteError("invalid-response", "The service returned a JSON-RPC error.");
+  }
+  return envelope.result;
+}
+
+export type McpToolSummary = Readonly<{
+  description: string | null;
+  destructive: boolean;
+  idempotent: boolean;
+  inputSchema: Readonly<Record<string, unknown>>;
+  name: string;
+  openWorld: boolean;
+  readOnly: boolean;
+}>;
+
+export type PreparedEvmTransaction = Readonly<{
+  chainId: 56 | 97;
+  data: Hex;
+  from: Address | null;
+  to: Address;
+  value: string;
+}>;
+
+export type McpToolCallResult = Readonly<{
+  result: Json;
+  tool: McpToolSummary;
+  transactions: readonly PreparedEvmTransaction[];
+}>;
+
+export type McpInspection = Readonly<{
+  responseTimeMs: number;
+  sessionId: string | null;
+  tools: readonly McpToolSummary[];
+}>;
+
+export type A2aAgentIdentity = Readonly<{
+  agentId: string;
+  chainId: number;
+  registryAddress: string;
+}>;
+
+function argumentsMatchSchema(
+  value: Readonly<Record<string, unknown>>,
+  schema: Readonly<Record<string, unknown>>,
+): boolean {
+  if (schema.type !== undefined && schema.type !== "object") return false;
+  const required = Array.isArray(schema.required)
+    ? schema.required.filter((item): item is string => typeof item === "string")
+    : [];
+  if (required.some((key) => !(key in value))) return false;
+
+  const properties =
+    typeof schema.properties === "object" &&
+    schema.properties !== null &&
+    !Array.isArray(schema.properties)
+      ? (schema.properties as Readonly<Record<string, unknown>>)
+      : {};
+  if (
+    schema.additionalProperties === false &&
+    Object.keys(value).some((key) => !(key in properties))
+  ) {
+    return false;
+  }
+
+  return Object.entries(value).every(([key, item]) => {
+    const rawRule = properties[key];
+    if (typeof rawRule !== "object" || rawRule === null || Array.isArray(rawRule)) {
+      return true;
+    }
+    const rule = rawRule as Readonly<Record<string, unknown>>;
+    if (rule.type === "string") return typeof item === "string";
+    if (rule.type === "number") return typeof item === "number" && Number.isFinite(item);
+    if (rule.type === "integer") return typeof item === "number" && Number.isInteger(item);
+    if (rule.type === "boolean") return typeof item === "boolean";
+    if (rule.type === "array") return Array.isArray(item);
+    if (rule.type === "object") return typeof item === "object" && item !== null && !Array.isArray(item);
+    return rule.type === undefined;
+  });
+}
+
+export async function inspectMcpService(
+  endpoint: string,
+  options: Readonly<{
+    fetchImpl?: typeof fetch;
+    maxBytes?: number;
+    resolveHost?: HostResolver;
+    timeoutMs?: number;
+  }> = {},
+): Promise<McpInspection> {
+  const initialize = await requestActivationService(endpoint, {
+    ...options,
+    body: JSON.stringify({
+      id: 1,
+      jsonrpc: "2.0",
+      method: "initialize",
+      params: {
+        capabilities: {},
+        clientInfo: { name: "Sift", version: "1.0.0" },
+        protocolVersion: "2025-06-18",
+      },
+    }),
+    method: "POST",
+  });
+  if (initialize.status < 200 || initialize.status >= 300) {
+    throw new ActivationRemoteError("http-error", "The MCP service rejected initialization.");
+  }
+  parseRpcResult(parseJsonOrSse(initialize.body));
+  const sessionId = initialize.headers.get("mcp-session-id");
+  const sessionHeaders = {
+    "mcp-protocol-version": "2025-06-18",
+    ...(sessionId ? { "mcp-session-id": sessionId } : {}),
+  };
+
+  const initialized = await requestActivationService(endpoint, {
+    ...options,
+    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    headers: sessionHeaders,
+    method: "POST",
+  });
+  if (initialized.status < 200 || initialized.status >= 300) {
+    throw new ActivationRemoteError("http-error", "The MCP service rejected initialization.");
+  }
+
+  const listed = await requestActivationService(endpoint, {
+    ...options,
+    body: JSON.stringify({ id: 2, jsonrpc: "2.0", method: "tools/list", params: {} }),
+    headers: sessionHeaders,
+    method: "POST",
+  });
+  if (listed.status < 200 || listed.status >= 300) {
+    throw new ActivationRemoteError("http-error", "The MCP service did not provide a tool list.");
+  }
+  const result = mcpToolsResultSchema.parse(parseRpcResult(parseJsonOrSse(listed.body)));
+  return {
+    responseTimeMs:
+      initialize.responseTimeMs +
+      initialized.responseTimeMs +
+      listed.responseTimeMs,
+    sessionId,
+    tools: result.tools.map((tool) => ({
+      description: tool.description ?? null,
+      destructive: tool.annotations?.destructiveHint === true,
+      idempotent: tool.annotations?.idempotentHint === true,
+      inputSchema: tool.inputSchema ?? {},
+      name: tool.name,
+      openWorld: tool.annotations?.openWorldHint === true,
+      readOnly: tool.annotations?.readOnlyHint === true,
+    })),
+  };
+}
+
+function parseTransactionChainId(value: unknown): number | null {
+  if (typeof value === "number" && Number.isSafeInteger(value)) return value;
+  if (typeof value !== "string" || !/^(?:0x[0-9a-f]+|[0-9]+)$/i.test(value)) {
+    return null;
+  }
+
+  const parsed = Number(BigInt(value));
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function parseTransactionValue(value: unknown): string | null {
+  if (value === undefined || value === null || value === "") return "0";
+  if (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+  ) {
+    return String(value);
+  }
+  if (
+    typeof value !== "string" ||
+    !/^(?:0x[0-9a-f]+|[0-9]+)$/i.test(value)
+  ) {
+    return null;
+  }
+
+  try {
+    const parsed = BigInt(value);
+    return parsed >= 0n && parsed < 2n ** 256n ? parsed.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function nestedJsonValues(value: unknown): readonly unknown[] {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !Array.isArray((value as Readonly<Record<string, unknown>>).content)
+  ) {
+    return [];
+  }
+
+  return (value as Readonly<{ content: readonly unknown[] }>).content.flatMap(
+    (item) => {
+      if (typeof item !== "object" || item === null || Array.isArray(item)) {
+        return [];
+      }
+      const text = (item as Readonly<Record<string, unknown>>).text;
+      if (typeof text !== "string" || text.length > 65_536) return [];
+      try {
+        return [JSON.parse(text) as unknown];
+      } catch {
+        return [];
+      }
+    },
+  );
+}
+
+/**
+ * Extract only bounded, structurally valid EVM requests from an untrusted MCP
+ * response. The caller still has to simulate, review, and approve every request
+ * in their wallet; this function never executes anything.
+ */
+export function extractPreparedEvmTransactions(
+  value: unknown,
+  expectedChainId: number,
+): readonly PreparedEvmTransaction[] {
+  if (expectedChainId !== 56 && expectedChainId !== 97) return [];
+  const supportedChainId: 56 | 97 = expectedChainId;
+
+  const queue: Readonly<{ depth: number; value: unknown }>[] = [
+    { depth: 0, value },
+    ...nestedJsonValues(value).map((nested) => ({ depth: 0, value: nested })),
+  ];
+  const transactions: PreparedEvmTransaction[] = [];
+  const seen = new Set<string>();
+  let inspected = 0;
+
+  while (queue.length > 0 && inspected < 500 && transactions.length < 10) {
+    const current = queue.shift();
+    if (!current) break;
+    inspected += 1;
+    if (current.depth > 7) continue;
+
+    if (Array.isArray(current.value)) {
+      queue.push(
+        ...current.value.slice(0, 50).map((item) => ({
+          depth: current.depth + 1,
+          value: item,
+        })),
+      );
+      continue;
+    }
+    if (
+      typeof current.value !== "object" ||
+      current.value === null
+    ) {
+      continue;
+    }
+
+    const candidate = current.value as Readonly<Record<string, unknown>>;
+    const rawData = candidate.data ?? candidate.calldata;
+    const chainId: number | null =
+      candidate.chainId === undefined
+        ? supportedChainId
+        : parseTransactionChainId(candidate.chainId);
+    const valueAmount = parseTransactionValue(candidate.value);
+    const data =
+      typeof rawData === "string" && isHex(rawData, { strict: true })
+        ? rawData
+        : rawData === undefined
+          ? "0x"
+          : null;
+    const from =
+      candidate.from === undefined
+        ? null
+        : typeof candidate.from === "string" && isAddress(candidate.from)
+          ? getAddress(candidate.from)
+          : undefined;
+
+    if (
+      typeof candidate.to === "string" &&
+      isAddress(candidate.to) &&
+      chainId === supportedChainId &&
+      valueAmount !== null &&
+      data !== null &&
+      from !== undefined &&
+      (data !== "0x" || valueAmount !== "0")
+    ) {
+      const transaction = {
+        chainId: supportedChainId,
+        data,
+        from,
+        to: getAddress(candidate.to),
+        value: valueAmount,
+      } as const;
+      const key = `${transaction.chainId}:${transaction.to}:${transaction.data}:${transaction.value}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        transactions.push(transaction);
+      }
+    }
+
+    queue.push(
+      ...Object.values(candidate).slice(0, 50).map((item) => ({
+        depth: current.depth + 1,
+        value: item,
+      })),
+    );
+  }
+
+  return transactions;
+}
+
+export async function callMcpTool(input: Readonly<{
+  arguments: Readonly<Record<string, unknown>>;
+  confirmedSideEffects: boolean;
+  endpoint: string;
+  expectedChainId: number;
+  fetchImpl?: typeof fetch;
+  maxBytes?: number;
+  resolveHost?: HostResolver;
+  timeoutMs?: number;
+  toolName: string;
+}>): Promise<McpToolCallResult> {
+  const inspection = await inspectMcpService(input.endpoint, input);
+  const tool = inspection.tools.find((candidate) => candidate.name === input.toolName);
+  if (!tool) {
+    throw new ActivationRemoteError(
+      "invalid-response",
+      "The selected tool is no longer published by this agent.",
+    );
+  }
+  if (!tool.readOnly && !input.confirmedSideEffects) {
+    throw new ActivationRemoteError(
+      "invalid-response",
+      "Confirm this external action before Sift sends it to the agent.",
+    );
+  }
+  if (!argumentsMatchSchema(input.arguments, tool.inputSchema)) {
+    throw new ActivationRemoteError(
+      "invalid-response",
+      "The tool arguments do not match the live MCP input schema.",
+    );
+  }
+  const response = await requestActivationService(input.endpoint, {
+    body: JSON.stringify({
+      id: 3,
+      jsonrpc: "2.0",
+      method: "tools/call",
+      params: { arguments: input.arguments, name: tool.name },
+    }),
+    fetchImpl: input.fetchImpl,
+    headers: inspection.sessionId
+      ? {
+          "mcp-protocol-version": "2025-06-18",
+          "mcp-session-id": inspection.sessionId,
+        }
+      : { "mcp-protocol-version": "2025-06-18" },
+    maxBytes: input.maxBytes,
+    method: "POST",
+    resolveHost: input.resolveHost,
+    timeoutMs: input.timeoutMs,
+  });
+  if (response.status < 200 || response.status >= 300) {
+    throw new ActivationRemoteError("http-error", "The MCP tool call failed.");
+  }
+  const result = json(parseRpcResult(parseJsonOrSse(response.body)));
+  return {
+    result,
+    tool,
+    transactions: extractPreparedEvmTransactions(
+      result,
+      input.expectedChainId,
+    ),
+  };
+}
+
+export async function callReadOnlyMcpTool(input: Readonly<{
+  arguments: Readonly<Record<string, unknown>>;
+  endpoint: string;
+  fetchImpl?: typeof fetch;
+  maxBytes?: number;
+  resolveHost?: HostResolver;
+  timeoutMs?: number;
+  toolName: string;
+}>): Promise<Json> {
+  const result = await callMcpTool({
+    ...input,
+    confirmedSideEffects: false,
+    expectedChainId: 56,
+  });
+  if (!result.tool.readOnly) {
+    throw new ActivationRemoteError(
+      "invalid-response",
+      "Sift only runs this tool through the confirmed action flow.",
+    );
+  }
+  return result.result;
+}
+
+export function a2aCardUrl(endpoint: string): string {
+  const url = new URL(endpoint);
+  if (url.pathname.toLowerCase().endsWith("/agent-card.json")) {
+    return url.toString();
+  }
+  return new URL("/.well-known/agent-card.json", url.origin).toString();
+}
+
+function a2aRoutingMetadata(
+  cardUrl: string,
+  registrations: readonly Readonly<{
+    agentId: number | string;
+    agentRegistry: string;
+  }>[],
+  identity: A2aAgentIdentity,
+  skillId?: string,
+): Readonly<Record<string, number | string>> {
+  const metadata: Record<string, number | string> = {
+    agentId: identity.agentId,
+    chainId: identity.chainId,
+    registryAddress: identity.registryAddress,
+  };
+  const selectedRegistry =
+    `eip155:${identity.chainId}:${identity.registryAddress}`.toLowerCase();
+  const selectedIdentityIsDeclared = registrations.some(
+    (registration) =>
+      String(registration.agentId) === identity.agentId &&
+      registration.agentRegistry.toLowerCase() === selectedRegistry,
+  );
+  const routeToken = new URL(cardUrl).pathname.match(
+    /\/agents\/(0|[1-9][0-9]*)\/agent-card\.json$/i,
+  )?.[1];
+  const routeTokenIsDeclared =
+    routeToken !== undefined &&
+    registrations.some(
+      (registration) => String(registration.agentId) === routeToken,
+    );
+
+  // Some multi-agent A2A hosts publish one task endpoint for many agent cards.
+  // Bind only a token explicitly present in the card and its URL; never infer
+  // one from the selected ERC-8004 identity.
+  if (selectedIdentityIsDeclared && routeToken && routeTokenIsDeclared) {
+    const numericToken = Number(routeToken);
+    metadata.nfaTokenId = Number.isSafeInteger(numericToken)
+      ? numericToken
+      : routeToken;
+  }
+  if (skillId) metadata.skillId = skillId;
+
+  return metadata;
+}
+
+export async function inspectA2aService(
+  endpoint: string,
+  options: Readonly<{
+    fetchImpl?: typeof fetch;
+    maxBytes?: number;
+    resolveHost?: HostResolver;
+    timeoutMs?: number;
+  }> = {},
+) {
+  const response = await requestActivationService(a2aCardUrl(endpoint), {
+    ...options,
+    method: "GET",
+  });
+  if (response.status < 200 || response.status >= 300) {
+    throw new ActivationRemoteError("http-error", "The A2A agent card is unavailable.");
+  }
+  const card = a2aCardSchema.parse(parseJsonBody(response.body));
+  const taskEndpoint = card.url ?? endpoint;
+  // Resolve and DNS-check the advertised task URL now; it is checked again on use.
+  const taskProbe = await requestActivationService(taskEndpoint, {
+    ...options,
+    body: JSON.stringify({ id: "sift-check", jsonrpc: "2.0", method: "tasks/get", params: { id: "sift-capability-check" } }),
+    method: "POST",
+  });
+  if (taskProbe.status < 200 || taskProbe.status >= 300) {
+    throw new ActivationRemoteError("http-error", "The A2A task service is unavailable.");
+  }
+  jsonRpcEnvelopeSchema.parse(parseJsonOrSse(taskProbe.body));
+  return {
+    card: {
+      description: card.description ?? null,
+      name: card.name,
+      registrations: (card.registrations ?? []).map((registration) => ({
+        agentId: String(registration.agentId),
+        agentRegistry: registration.agentRegistry,
+      })),
+      skills: (card.skills ?? []).map((skill) => ({
+        description: skill.description ?? null,
+        id: skill.id,
+        name: skill.name,
+      })),
+      taskEndpoint,
+    },
+    responseTimeMs: response.responseTimeMs,
+  };
+}
+
+export async function sendA2aTask(input: Readonly<{
+  agent: A2aAgentIdentity;
+  endpoint: string;
+  fetchImpl?: typeof fetch;
+  maxBytes?: number;
+  message: string;
+  resolveHost?: HostResolver;
+  skillId?: string;
+  timeoutMs?: number;
+}>): Promise<Json> {
+  const inspection = await inspectA2aService(input.endpoint, input);
+  const currentSkillId = inspection.card.skills.some(
+    (skill) => skill.id === input.skillId,
+  )
+    ? input.skillId
+    : undefined;
+  const response = await requestActivationService(inspection.card.taskEndpoint, {
+    body: JSON.stringify({
+      id: crypto.randomUUID(),
+      jsonrpc: "2.0",
+      method: "message/send",
+      params: {
+        message: {
+          kind: "message",
+          messageId: crypto.randomUUID(),
+          metadata: a2aRoutingMetadata(
+            a2aCardUrl(input.endpoint),
+            inspection.card.registrations,
+            input.agent,
+            currentSkillId,
+          ),
+          parts: [{ kind: "text", text: input.message }],
+          role: "user",
+        },
+      },
+    }),
+    fetchImpl: input.fetchImpl,
+    maxBytes: input.maxBytes,
+    method: "POST",
+    resolveHost: input.resolveHost,
+    timeoutMs: input.timeoutMs,
+  });
+  if (response.status < 200 || response.status >= 300) {
+    throw new ActivationRemoteError("http-error", "The A2A task request failed.");
+  }
+  return json(parseRpcResult(parseJsonOrSse(response.body)));
+}
+
+function decodePaymentRequired(value: string): unknown {
+  try {
+    return JSON.parse(Buffer.from(value, "base64").toString("utf8")) as unknown;
+  } catch {
+    throw new ActivationRemoteError("invalid-response", "The x402 payment challenge is invalid.");
+  }
+}
+
+export async function inspectX402Service(
+  endpoint: string,
+  chainId: number,
+  options: Readonly<{
+    fetchImpl?: typeof fetch;
+    maxBytes?: number;
+    resolveHost?: HostResolver;
+    timeoutMs?: number;
+  }> = {},
+) {
+  const response = await requestActivationService(endpoint, { ...options, method: "GET" });
+  if (response.status >= 200 && response.status < 300) {
+    return {
+      challenge: null,
+      free: true,
+      options: [],
+      resource: parsePaidResource(response.body),
+      responseTimeMs: response.responseTimeMs,
+    };
+  }
+  if (response.status !== 402) {
+    throw new ActivationRemoteError("http-error", "The x402 service is unavailable.");
+  }
+  const header = response.headers.get("payment-required");
+  const raw = header ? decodePaymentRequired(header) : parseJsonBody(response.body);
+  let challenge;
+  try {
+    challenge = parseBnbX402Challenge(raw, chainId);
+  } catch (error) {
+    throw new ActivationRemoteError(
+      "invalid-response",
+      error instanceof Error
+        ? error.message
+        : "The x402 payment challenge is unsupported.",
+    );
+  }
+  return {
+    challenge,
+    free: false,
+    options: x402OptionsFromChallenge(challenge),
+    resource: null,
+    responseTimeMs: response.responseTimeMs,
+  };
+}
+
+function parsePaidResource(body: string): Json {
+  const normalized = body.trim();
+  if (!normalized) return null;
+  try {
+    return json(JSON.parse(normalized) as unknown);
+  } catch {
+    return normalized;
+  }
+}
+
+export type X402ExecutionResult = Readonly<{
+  resource: Json;
+  settlement: Json | null;
+}>;
+
+/**
+ * Re-read the current quote, bind the signed authorization to it, and relay it
+ * only to the indexed endpoint. This function never signs or retries payment.
+ */
+export async function executeX402Service(input: Readonly<{
+  chainId: number;
+  endpoint: string;
+  fetchImpl?: typeof fetch;
+  maxBytes?: number;
+  payer: string;
+  paymentPayload: unknown;
+  preference?: X402OptionPreference;
+  resolveHost?: HostResolver;
+  timeoutMs?: number;
+}>): Promise<X402ExecutionResult> {
+  const inspection = await inspectX402Service(input.endpoint, input.chainId, input);
+  if (inspection.free || !inspection.challenge) {
+    throw new ActivationRemoteError(
+      "invalid-response",
+      "This resource no longer requires the payment that was reviewed.",
+    );
+  }
+
+  let payment: Readonly<{ payload: BnbX402PaymentPayload }>;
+  try {
+    payment = validateX402PaymentPayload(
+      input.paymentPayload,
+      inspection.challenge,
+      input.chainId,
+      input.payer,
+    );
+  } catch (error) {
+    throw new ActivationRemoteError(
+      "invalid-response",
+      error instanceof Error
+        ? error.message
+        : "The signed payment does not match the live quote.",
+    );
+  }
+
+  const paymentHeader = x402PaymentHeader(payment.payload);
+  const response = await requestActivationService(input.endpoint, {
+    body: undefined,
+    fetchImpl: input.fetchImpl,
+    headers: { [paymentHeader.name]: paymentHeader.value },
+    maxBytes: input.maxBytes,
+    method: "GET",
+    resolveHost: input.resolveHost,
+    timeoutMs: input.timeoutMs,
+  });
+  if (response.status === 402) {
+    throw new ActivationRemoteError(
+      "invalid-response",
+      "The provider rejected the payment authorization. Check the token balance and try again with a new quote.",
+    );
+  }
+  if (response.status < 200 || response.status >= 300) {
+    throw new ActivationRemoteError(
+      "http-error",
+      "The provider could not deliver the paid result.",
+    );
+  }
+
+  const settlementHeader =
+    response.headers.get("payment-response") ??
+    response.headers.get("x-payment-response");
+  let settlement: Json | null = null;
+  if (settlementHeader) {
+    try {
+      const decoded = decodePaymentResponseHeader(settlementHeader);
+      if (!decoded.success) {
+        throw new Error("The provider reported that settlement failed.");
+      }
+      settlement = json(decoded);
+    } catch (error) {
+      throw new ActivationRemoteError(
+        "invalid-response",
+        error instanceof Error
+          ? error.message
+          : "The provider returned invalid settlement evidence.",
+      );
+    }
+  }
+
+  return {
+    resource: parsePaidResource(response.body),
+    settlement,
+  };
+}

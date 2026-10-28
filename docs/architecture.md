@@ -1,0 +1,110 @@
+# Sift architecture
+
+Sift is an evidence-led discovery, comparison, BNB Chain hiring, and monitoring
+layer for AI agents on BNB Chain. The catalogue and evidence shown to users are
+source-backed; unavailable inputs remain visibly unavailable.
+
+```mermaid
+flowchart LR
+  mainnet["BSC Mainnet\nERC-8004 registry"]
+  testnet["BSC Testnet\nERC-8004 registry"]
+  rpc["Public / free RPC\nwith fallbacks"]
+  metadata["Agent registration files\nand declared services"]
+  indexer["Sift Indexer\nGitHub Actions"]
+  taxonomy["Versioned category evidence\nand curated shortlist"]
+  scan["8004scan API\noptional cross-check"]
+  assessment["Health + Sift Score + task checks\nGitHub Actions"]
+  direct["Checked A2A / MCP / x402\nagent services"]
+  db[("Supabase PostgreSQL\nRLS + server-only access")]
+  app["Next.js App Router\nVercel"]
+  browser["Judge browser"]
+  wallet["User-controlled wallet"]
+  altana["Altana passkey wallet\n+ bounded session"]
+  keystore["Altana KeyStore\npublic authority"]
+  apex["BNB Chain\nERC-8183 / APEX"]
+
+  mainnet --> rpc --> indexer
+  testnet --> rpc
+  metadata --> indexer
+  indexer --> db
+  indexer --> taxonomy --> db
+  scan -->|"bounded server-side cache"| db
+  metadata --> assessment
+  db <--> assessment
+  browser <--> app
+  app <--> db
+  app -->|"one confirmed, bounded request"| direct
+  browser <--> wallet
+  wallet -->|"explicitly approved transactions"| apex
+  browser <--> altana
+  altana -->|"registered session"| keystore
+  altana -->|"bounded atomic hire"| apex
+  keystore -->|"status at receipt block"| rpc
+  apex -->|"receipts and job state"| rpc
+  rpc -->|"server-side verification"| app
+  app -->|"verified job/activity evidence"| db
+```
+
+## Runtime boundaries
+
+- The Sift Indexer reads confirmed BSC Mainnet and BSC Testnet ERC-8004 registry events,
+  validates bounded external metadata, and writes normalized identities and
+  services. Identity keys and checkpoints remain scoped by chain and registry.
+  The indexer has no wallet or signing key.
+- The health and score workflow checks eligible public declarations in bounded
+  batches, records the observation source/time, and calculates a versioned Sift
+  Score only when enough current evidence exists.
+- The same bounded workflow checks explicitly declared ERC-8183, A2A, MCP, and
+  x402 services. A current successful observation enables **Hire agent**;
+  registration or an unchecked metadata label does not. Direct endpoints are
+  resolved from stored service IDs, restricted to public HTTPS, size/time
+  bounded, and rechecked immediately before an action.
+- The shared M14 taxonomy classifies validated metadata during indexing and a
+  resumable historical backfill. Discovery reads materialized evidence instead
+  of rescanning the catalogue or duplicating keyword rules in UI code.
+- 8004scan is an optional validation/enrichment boundary for the 12-agent
+  shortlist. Its key, requests, raw cache, normalized evidence and failures
+  remain server-side. Sift discovery never depends on that service.
+- Next.js Server Components and server route handlers read through typed,
+  server-only repositories. `SUPABASE_SECRET_KEY` never enters the browser.
+- The browser owns wallet interaction. Sift requests each chain-bound action
+  explicitly and never receives a private key or seed phrase.
+- The optional Altana browser boundary creates an OS-protected passkey wallet.
+  It retains the live generated session signer only in React memory and stores
+  only public wallet, credential-handle, permission, and transaction evidence
+  locally. Altana KeyStore exposes the public session authority and revocation
+  state on-chain.
+- After a transaction, the server independently checks the sender, chain,
+  destination, calldata, receipt, event, confirmations, and protocol state
+  before recording it as confirmed.
+- Dashboard access requires a short-lived signed ownership challenge. Opaque
+  session material is held in HttpOnly cookies; only digests are persisted.
+- A2A messages require an explicit confirmation and are sent once. MCP execution
+  is limited to tools whose live declaration says `readOnlyHint: true`. x402
+  challenges expose the exact network, token, recipient, and raw amount, but
+  Sift does not yet execute their payment.
+
+## Deployment topology
+
+| Layer | Deployment | Purpose |
+| --- | --- | --- |
+| Web | Vercel free tier | Next.js pages, metadata, server reads, verification APIs |
+| Data | Hosted Supabase (paid plan) | PostgreSQL catalogue, evidence, jobs, activity, wallet sessions |
+| Scheduled operations | GitHub Actions | Two-hour incremental indexing and six-hour health/scoring batches |
+| Chain reads | Public/free BNB RPC fallbacks | ERC-8004 ingestion and ERC-8183 verification |
+| Wallet writes | User-controlled wallet or Altana passkey/session | Explicit chain-bound BSC Mainnet or Testnet ERC-8183/APEX transactions only |
+
+The detailed database, indexer, scoring, hiring, dashboard, and security
+contracts are documented in their focused files under `docs/`. This diagram
+must be updated if a deployment boundary changes.
+
+Discovery, indexing, wallet connection, task execution, hiring, and dashboard
+access support BSC Mainnet chain `56` and BSC Testnet chain `97`. The selected
+catalogue network is persistent, but quotes, RPC reads, wallet clients, stored
+jobs, receipt verification, and explorer links remain bound to the agent's
+actual chain. Mainnet requires a real-funds acknowledgement and every write
+still requires explicit wallet confirmation.
+The protected option keeps token approval under the passkey admin and gives the
+one-hour session only the four reviewed hiring functions plus exact token and
+native-gas caps. Its atomic result is persisted only after the same job evidence
+and historical KeyStore authority are verified by the server.

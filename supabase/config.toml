@@ -1,0 +1,11 @@
+# Repository configuration read by the hosted Supabase GitHub integration.
+project_id = "sift"
+
+[db.migrations]
+enabled = true
+schema_paths = []
+
+# Hosted deployments never seed invented agent or blockchain records.
+[db.seed]
+enabled = false
+sql_paths = []

@@ -1,0 +1,150 @@
+# ERC-8183 hiring
+
+Sift implements a client-side wallet checkout for real indexed agents that expose the current BNB Agent SDK ERC-8183 HTTP service on BSC Mainnet or BSC Testnet. The browser signs transactions; Sift never receives signing material and does not mark a step confirmed until its server independently verifies the selected chain, calldata, receipt, events, and confirmations.
+
+Users can now choose either the original connected-wallet sequence or M20's
+Altana protected-session sequence. The Altana path uses an OS-protected passkey
+wallet, a one-hour registered KeyStore session, an exact token cap, a bounded
+native-gas cap, and only four reviewed ERC-8183 function signatures. Sift never
+stores the generated session signer: it remains in page memory only.
+
+## Verified protocol selection
+
+The integration was re-verified on 2026-09-07 against the official [ERC-8183 draft](https://eips.ethereum.org/EIPS/eip-8183), [BNB Agent SDK](https://github.com/bnb-chain/bnbagent-sdk), and the `main` branch of [bnb-chain/apex-contracts](https://github.com/bnb-chain/apex-contracts). ERC-8183 remains a draft standard and APEX is under active development, so Sift validates deployment relationships at runtime instead of trusting addresses alone.
+
+Sift supports these two reviewed deployments only:
+
+| Item | BSC Mainnet (`56`) | BSC Testnet (`97`) |
+| --- | --- | --- |
+| AgenticCommerce | `0xEa4DAa3100A767e86FDed867729ae7446476EBA6` | `0xa206c0517B6371C6638CD9e4a42Cc9f02A33B0DE` |
+| EvaluatorRouter | `0x51895229E12F9876011789B04f8698af06cCD6DA` | `0xd7d36d66d2f1B608a0f943f722d27e3744f66f25` |
+| OptimisticPolicy | `0x9C01845705b3078Aa2e8cfF7520a6376FD766dE5` | `0xd6a4217588f6b1f5657a92a3e94e6422ad771cea` |
+| Payment token | `0xcE24439F2D9C6a2289F741120FE202248B666666` (`U`, 18 decimals) | `0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565` (`U`, 18 decimals) |
+| Confirmation policy | 2 blocks | 2 blocks |
+
+The official deployment source of truth is `apex-contracts/scripts/addresses.ts`. Sift additionally reads live contract bytecode, token, router/commerce relationships, policy whitelist, pause flags, platform fee, token metadata, dispute window, and latest block time before accepting a quote.
+
+Server-side hiring reads use the selected chain's `BNB_MAINNET_RPC_*` or
+`BNB_TESTNET_RPC_*` variables, followed by public endpoints for that chain.
+They never reuse generic `BNB_RPC_*` indexer settings, so an indexer
+configuration cannot redirect a hiring check to another network.
+
+## Compatibility and negotiation
+
+The durable M15 compatibility and activation evidence contract is recorded in
+[activation-proof.md](activation-proof.md). The UI now reports the first exact
+static compatibility failure rather than reducing every unsupported identity to
+one generic message.
+
+An indexed agent is shown as hireable only when all of these are true:
+
+- it is on BSC Mainnet (`56`) or BSC Testnet (`97`), has currently valid indexed metadata, and is not declared inactive;
+- its indexed owner is a valid EVM address;
+- it declares an `ERC-8183` service at a public HTTPS endpoint without credentials, query parameters, a private host, or a reserved placeholder hostname;
+- a declared service version is unversioned or within the reviewed `0.x`/`1.x`
+  range; unknown future major versions fail closed;
+- its `/status` response exactly matches the indexed owner and verified deployment (an omitted legacy `decimals` field is resolved from the live verified token contract, while a conflicting declared value is rejected);
+- its `/negotiate` response accepts the normalized terms, targets the verified deployment and token, remains inside the user's maximum spend, and contains a provider signature that Sift verifies as EIP-191 or ERC-1271.
+
+Negotiation is off-chain; the signed canonical description is then committed to the job. Agent endpoints are fetched server-side with DNS/private-network blocking, manual redirect revalidation, a timeout, and a 64 KB response limit.
+
+## Exact transaction sequence
+
+The current APEX contract requires separate explicit wallet actions:
+
+1. `AgenticCommerce.createJob(provider, router, expiredAt, signedDescription, router)`;
+2. `EvaluatorRouter.registerJob(jobId, policy)`;
+3. `AgenticCommerce.setBudget(jobId, signedPrice, 0x)`;
+4. `U.approve(commerce, signedPrice)` only when the live allowance is below the price;
+5. `AgenticCommerce.fund(jobId, signedPrice, 0x)`.
+
+Sift simulates each call before requesting a signature. Approvals are exact, never unlimited. The server verifies chain ID, sender, destination, zero native value, decoded arguments, receipt status, expected protocol event, two confirmations, and the final funded job state. The job expiry is compared with the mined block timestamp, not the later API verification time. Mainnet review additionally requires an explicit real-funds acknowledgement before an intent can be created.
+
+In protected mode, the pinned official Altana SDK builds the same five-call
+bundle. Sift removes exactly the token approval call and fails closed if the
+bundle shape changes. The passkey admin separately provisions only the exact
+Commerce allowance; the registered session then submits create, register,
+budget, and fund atomically. The server accepts the result only when all four
+events, the funded job state, two confirmations, and the session's historical
+KeyStore registration match the saved quote.
+
+Sift checks every bundled mainnet deployment field against the reviewed
+constants before enabling Altana. Any mismatch fails closed.
+
+For Testnet, Sift recognizes the documented Altana SDK policy-address mismatch
+and passes the current reviewed BNB Agent SDK policy explicitly. Any other
+deployment mismatch still fails closed.
+
+See [the beginner protected-hiring test runbook](altana-session-testing.md).
+
+## Persistence and resume security
+
+Migration `20260823090000_add_hiring_jobs.sql` adds `jobs`, `job_transactions`, and `job_activity`. These service-role-only tables have Row Level Security enabled and no browser policy. Unique idempotency, chain/job, step, and transaction constraints prevent duplicate records.
+
+Before the first wallet prompt, the server persists the exact normalized mission and signed quote. The browser keeps a random 256-bit resume capability in local storage; only its SHA-256 digest is stored in PostgreSQL. A reload can check or resume a pending step, but no transaction is automatically signed or sent. A different connected wallet cannot resume the job.
+
+If the connected account changes before any blockchain transaction exists,
+the wallet step can explicitly cancel the untouched database intent and return
+to the populated mission form for a fresh quote. Once a transaction has been
+submitted or an on-chain job ID exists, restart is disabled and the original
+wallet is required; this prevents silently abandoning or duplicating an
+on-chain job.
+
+The non-secret mission fields are also kept in bounded local browser storage so
+a reload does not erase work. Quotes, signatures, approvals, resume
+capabilities, wallet sessions, and transactions are not stored in that draft.
+A wallet change clears a quote that was requested while another wallet was
+connected and requires a fresh review.
+
+## Testnet demo prerequisites
+
+Use a disposable test wallet. Testnet tokens have no monetary value, but private
+keys and seed phrases must still never be pasted into Sift or committed.
+
+1. Add BSC Testnet (chain ID `97`) to the wallet.
+2. Get test BNB from the official BNB Chain faucet.
+3. Get test-only `U` from the faucet listed by the BNB Agent SDK when a quote is above zero.
+4. Select **BSC Testnet** in Sift, open a compatible chain-97 agent, and review every displayed contract and amount.
+5. Approve or reject each wallet request deliberately, then verify any submitted transaction through Testnet BscScan.
+
+## Mainnet prerequisites and warning
+
+Mainnet hiring can spend real assets. Use it only with a wallet and amount you
+intend to risk. Sift requires the agent's live `/status` and signed quote to
+match the verified chain-56 contracts, displays the exact token and destination,
+requires a mainnet acknowledgement, simulates each call, and still asks for a
+separate wallet confirmation for every write. The user pays mainnet gas and any
+payment-token funding; Sift does not sponsor, custody, recover, or reverse those
+transactions.
+
+Migration `20260908110000_enable_mainnet_hiring.sql` must be deployed to hosted
+Supabase before launch. Confirm the payment token and
+all displayed contract addresses against the official deployment source before
+approving a real transaction.
+
+## Known limitations
+
+- ERC-8183 and BNB APEX are active-development infrastructure. A deployment rotation intentionally makes Sift fail closed until its typed constants are reviewed and updated.
+- Only safe, exact ERC-8183 declarations are hireable; stale, local, malformed, or unreachable endpoints remain visible as declarations but cannot produce a Sift hiring flow.
+- M9 confirms job creation and escrow funding. It does not claim the provider delivered work or the evaluator accepted it.
+- M10 monitors persisted jobs and verified protocol state. Refunds, disputes, pause, and revoke controls remain omitted because the current verified Sift client does not implement those writes.
+- Sift does not implement custody, autonomous signing, delivery guarantees,
+  refunds, disputes, or pause/revoke writes.
+- Protected-session revocation applies to Altana wallet authority, not an
+  already confirmed ERC-8183 escrow job or an earlier passkey-approved token
+  allowance. Passkey-wallet dashboard authorization is not yet implemented.
+
+## Validation
+
+Run:
+
+```bash
+npm run lint
+npm run typecheck
+npm test
+npm run test:wallet-ui
+npm run verify:hiring-deployments
+npm run build
+```
+
+The automated tests use clearly labelled deterministic fixtures and never write fabricated agent or chain data to the hosted catalogue. A real happy-path transaction still requires a human to approve each request. Automated validation must never send a mainnet transaction.

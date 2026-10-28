@@ -1,0 +1,85 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import type { Address, Hex } from "viem";
+
+import { createLogger } from "../../lib/indexer/logger";
+import {
+  RegistryRpcPool,
+  type RegistryRpcProvider,
+} from "../../lib/indexer/rpc";
+
+const registry = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432";
+
+function provider(
+  name: string,
+  overrides: Partial<RegistryRpcProvider> = {},
+): RegistryRpcProvider {
+  return {
+    getBlockNumber: async () => 100n,
+    getBlockTimestamp: async () => 1_700_000_000n,
+    getBytecode: async () => "0x01" as Hex,
+    getChainId: async () => 56,
+    getLogs: async () => [],
+    name,
+    ownerOf: async () =>
+      "0x1111111111111111111111111111111111111111" as Address,
+    tokenUri: async () => "",
+    ...overrides,
+  };
+}
+
+describe("ordered RPC fallback", () => {
+  it("uses a healthy fallback and emits observable sanitized logs", async () => {
+    const lines: string[] = [];
+    const pool = new RegistryRpcPool(
+      [
+        provider("primary", {
+          getLogs: async () => {
+            throw new Error(
+              "failed https://rpc.example/v3/path-secret?apiKey=query-secret",
+            );
+          },
+        }),
+        provider("fallback"),
+      ],
+      createLogger((line) => lines.push(line)),
+    );
+
+    await pool.validate(56, registry);
+    assert.deepEqual(await pool.getLogs(registry, 1n, 2n), []);
+    assert.equal(lines.some((line) => line.includes("rpc_fallback_used")), true);
+    assert.equal(lines.some((line) => line.includes("path-secret")), false);
+    assert.equal(lines.some((line) => line.includes("query-secret")), false);
+  });
+
+  it("rejects providers connected to a different chain", async () => {
+    const pool = new RegistryRpcPool(
+      [provider("wrong-chain", { getChainId: async () => 97 })],
+      createLogger(() => undefined),
+    );
+
+    await assert.rejects(() => pool.validate(56, registry));
+  });
+
+  it("uses the highest observed head when a healthy provider is behind", async () => {
+    const lines: string[] = [];
+    const pool = new RegistryRpcPool(
+      [
+        provider("lagging-primary", { getBlockNumber: async () => 100n }),
+        provider("current-fallback", { getBlockNumber: async () => 125n }),
+      ],
+      createLogger((line) => lines.push(line)),
+    );
+
+    await pool.validate(56, registry);
+    assert.equal(await pool.getBlockNumber(), 125n);
+    assert.equal(
+      lines.some(
+        (line) =>
+          line.includes("rpc_fallback_used") &&
+          line.includes("current-fallback"),
+      ),
+      true,
+    );
+  });
+});

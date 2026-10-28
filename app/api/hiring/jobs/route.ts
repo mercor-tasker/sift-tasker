@@ -1,0 +1,176 @@
+import { getAddress, type Address } from "viem";
+import { z } from "zod";
+
+import { parseAgentProfileIdentity } from "@/features/agents/route";
+import { getAgentProfile } from "@/features/agents/service";
+import { assertActivationBinding } from "@/features/hiring/binding";
+import { resolveHiringCompatibility } from "@/features/hiring/compatibility";
+import {
+  isHiringIdempotencyKey,
+  isHiringResumeToken,
+} from "@/features/hiring/idempotency";
+import { HiringQuoteError, validateHiringQuote } from "@/features/hiring/quote";
+import { isHiringChainId } from "@/features/hiring/protocol";
+import { parseHiringMission } from "@/features/hiring/validation";
+import {
+  getHiringPublicClient,
+  verifyErc8183Runtime,
+} from "@/lib/blockchain/hiring-client";
+import {
+  createHiringIntent,
+  HiringConflictError,
+} from "@/lib/db/hiring-repository";
+import {
+  ApiRequestError,
+  checkApiRateLimit,
+  isSameOriginRequest,
+  rateLimitResponse,
+  readBoundedJson,
+} from "@/lib/security/api-request";
+
+export const runtime = "nodejs";
+
+const requestSchema = z.object({
+  agentId: z.string(),
+  chainId: z.number().int().positive(),
+  deliverables: z.string(),
+  durationSeconds: z.number(),
+  idempotencyKey: z.string(),
+  mainnetRiskAccepted: z.boolean(),
+  maxSpend: z.string(),
+  mission: z.string(),
+  qualityStandards: z.string(),
+  resumeToken: z.string(),
+  signedEnvelope: z.record(z.string(), z.unknown()),
+  walletAddress: z.string(),
+});
+
+function json(body: unknown, status = 200): Response {
+  return Response.json(body, {
+    status,
+    headers: { "cache-control": "no-store" },
+  });
+}
+
+export async function POST(request: Request): Promise<Response> {
+  if (!isSameOriginRequest(request)) {
+    return json({ error: "Invalid hiring request." }, 400);
+  }
+
+  const rateLimit = checkApiRateLimit(request, {
+    capacity: 8,
+    namespace: "hiring:create",
+    windowMs: 60_000,
+  });
+  if (!rateLimit.allowed) return rateLimitResponse(rateLimit);
+
+  try {
+    const raw = requestSchema.parse(await readBoundedJson(request, 24_576));
+    const identity = parseAgentProfileIdentity(
+      String(raw.chainId),
+      raw.agentId,
+    );
+
+    if (
+      !identity ||
+      !isHiringChainId(identity.chainId) ||
+      !isHiringIdempotencyKey(raw.idempotencyKey) ||
+      !isHiringResumeToken(raw.resumeToken)
+    ) {
+      return json({ error: "Invalid hiring request IDs." }, 400);
+    }
+
+    let walletAddress: Address;
+
+    try {
+      walletAddress = getAddress(raw.walletAddress);
+    } catch {
+      return json({ error: "Connect a valid wallet before continuing." }, 400);
+    }
+
+    const mission = parseHiringMission(raw, identity.chainId);
+
+    if (identity.chainId === 56 && !raw.mainnetRiskAccepted) {
+      return json(
+        { error: "Confirm the BSC Mainnet funds warning before continuing." },
+        400,
+      );
+    }
+    const profile = await getAgentProfile(identity.chainId, identity.agentId);
+
+    if (
+      !profile?.ownerAddress ||
+      !resolveHiringCompatibility(profile)
+    ) {
+      return json({ error: "The selected agent is not currently available to hire." }, 409);
+    }
+
+    const publicClient = getHiringPublicClient(identity.chainId);
+    const runtimeState = await verifyErc8183Runtime(
+      identity.chainId,
+      publicClient,
+    );
+    const quote = await validateHiringQuote({
+      chainId: identity.chainId,
+      disputeWindowSeconds: runtimeState.disputeWindowSeconds,
+      envelope: raw.signedEnvelope,
+      mission,
+      now: runtimeState.blockTimestamp * 1_000,
+      platformFeeBasisPoints: runtimeState.platformFeeBasisPoints,
+      provider: getAddress(profile.ownerAddress),
+      publicClient,
+    });
+    assertActivationBinding({
+      agent: {
+        chainId: identity.chainId,
+        ownerAddress: getAddress(profile.ownerAddress),
+      },
+      mission,
+      now: runtimeState.blockTimestamp * 1_000,
+      quote,
+      walletAddress,
+    });
+    const result = await createHiringIntent({
+      agentId: identity.agentId,
+      chainId: identity.chainId,
+      deliverables: mission.deliverables,
+      durationSeconds: mission.durationSeconds,
+      idempotencyKey: raw.idempotencyKey,
+      mainnetRiskAccepted: raw.mainnetRiskAccepted,
+      maxSpend: mission.maxSpend,
+      mission: mission.mission,
+      qualityStandards: mission.qualityStandards,
+      quote,
+      resumeToken: raw.resumeToken,
+      walletAddress,
+    });
+
+    return json(
+      { created: result.created, intent: result.snapshot },
+      result.created ? 201 : 200,
+    );
+  } catch (error) {
+    if (error instanceof ApiRequestError) {
+      return json({ error: error.message }, error.status);
+    }
+    if (error instanceof z.ZodError) {
+      return json(
+        { error: error.issues[0]?.message ?? "Invalid hiring request." },
+        400,
+      );
+    }
+
+    if (error instanceof HiringQuoteError) {
+      return json({ code: error.code, error: error.message }, 409);
+    }
+
+    if (error instanceof HiringConflictError) {
+      return json({ error: error.message }, 409);
+    }
+
+    console.error("[hiring] intent creation failed", {
+      error: error instanceof Error ? error.name : "UnknownError",
+    });
+    return json({ error: "Sift could not save the hiring request." }, 500);
+  }
+}

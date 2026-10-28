@@ -1,0 +1,291 @@
+import {
+  BadgeCheck,
+  BriefcaseBusiness,
+  CircleAlert,
+  Clock3,
+  ExternalLink,
+  Gauge,
+  RadioTower,
+} from "lucide-react";
+import Link from "next/link";
+import type { ReactNode } from "react";
+
+import { BookmarkToggle } from "@/components/bookmarks/bookmark-toggle";
+import { ComparisonToggle } from "@/components/comparison/comparison-toggle";
+import { AgentAvatar } from "@/components/discovery/agent-avatar";
+import { AnimatedRatingValue } from "@/components/scoring/animated-rating-value";
+import { ScoreCriteriaTooltip } from "@/components/scoring/score-criteria-tooltip";
+import { buttonVariants } from "@/components/ui/button";
+import { formatProfileTimestamp } from "@/features/agents/format";
+import { buildExplorerAddressHref } from "@/features/agents/links";
+import type { AgentProfile } from "@/features/agents/model";
+import {
+  describeProfileProvenance,
+  hasHumanReadableMetadata,
+} from "@/features/agents/presentation";
+import {
+  formatAgentName,
+  formatChainName,
+  formatMetadataStatus,
+} from "@/features/discovery/format";
+import { assessHiringCompatibility } from "@/features/hiring/compatibility";
+import { getHealthPresentation } from "@/features/health/presentation";
+import { getAgentRating } from "@/features/scoring/presentation";
+import { cn } from "@/lib/utils";
+import {
+  currentActivationServices,
+  externalAgentServices,
+} from "@/features/activation/service";
+import { formatActivationMethod } from "@/features/activation/model";
+
+interface ProfileHeaderProps {
+  comparisonGoal?: string;
+  profile: AgentProfile;
+}
+
+interface EvidenceStatProps {
+  detail: string;
+  icon: ReactNode;
+  label: ReactNode;
+  value: ReactNode;
+}
+
+const provenanceToneStyles = {
+  caution: "border-amber-400/25 bg-amber-400/8 text-amber-100",
+  good: "border-emerald-400/25 bg-emerald-400/8 text-emerald-100",
+  neutral: "border-sky-400/25 bg-sky-400/8 text-sky-100",
+} as const;
+
+function EvidenceStat({ detail, icon, label, value }: EvidenceStatProps) {
+  return (
+    <div className="min-w-0 bg-card p-4 sm:p-5">
+      <dt className="flex min-h-4 items-center gap-2 text-xs leading-none font-medium text-muted-foreground">
+        <span className="grid size-4 shrink-0 place-items-center [&>svg]:block">
+          {icon}
+        </span>
+        <span className="inline-flex items-center gap-1 leading-none">{label}</span>
+      </dt>
+      <dd className="mt-3 truncate text-sm font-semibold capitalize text-foreground">
+        {value}
+      </dd>
+      <p className="mt-1 truncate text-xs text-muted-foreground" title={detail}>
+        {detail}
+      </p>
+    </div>
+  );
+}
+
+export function ProfileHeader({
+  comparisonGoal = "",
+  profile,
+}: ProfileHeaderProps) {
+  const name = formatAgentName(profile.name, profile.agentId);
+  const provenance = describeProfileProvenance(
+    profile.metadataStatus,
+    hasHumanReadableMetadata(profile),
+    profile.metadataVerifiedAt,
+  );
+  const registryHref = buildExplorerAddressHref(
+    profile.chainId,
+    profile.registryAddress,
+  );
+  const rating = getAgentRating(profile);
+  const healthPresentation = getHealthPresentation(
+    profile.health,
+    profile.services,
+  );
+  const hiring = assessHiringCompatibility(profile);
+  const hireable = hiring.compatibility !== null;
+  const taskServices = currentActivationServices(profile.services);
+  const externalServices = externalAgentServices(profile.services);
+  const agentCanBeUsed =
+    profile.metadataStatus === "valid" &&
+    profile.active !== false;
+  const taskReady = agentCanBeUsed && taskServices.length > 0;
+  const externalReady = agentCanBeUsed && externalServices.length > 0;
+  const canUseAgent = taskReady || externalReady;
+  const ratingDetail = rating.kind === "stale"
+    ? `Update needed · ${rating.detail}`
+    : rating.detail;
+
+  return (
+    <header className="relative overflow-hidden border-b border-border bg-card">
+      <div
+        aria-hidden="true"
+        className="absolute inset-0 bg-[radial-gradient(circle_at_75%_-20%,rgba(240,185,11,0.18),transparent_34rem),linear-gradient(115deg,transparent_0%,rgba(240,185,11,0.025)_65%,transparent_100%)]"
+      />
+
+      <div className="relative mx-auto w-full max-w-7xl px-4 py-8 sm:px-6 sm:py-10 lg:px-8">
+        <nav aria-label="Breadcrumb" className="text-xs text-muted-foreground">
+          <ol className="flex items-center gap-2">
+            <li>
+              <Link
+                href="/discover"
+                className="rounded-sm outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/30"
+              >
+                Discover
+              </Link>
+            </li>
+            <li aria-hidden="true">/</li>
+            <li aria-current="page" className="text-foreground">
+              Agent #{profile.agentId}
+            </li>
+          </ol>
+        </nav>
+
+        <div className="mt-6 flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between">
+          <div className="flex min-w-0 flex-col gap-5 sm:flex-row sm:items-start">
+            <AgentAvatar
+              agentId={profile.agentId}
+              imageUrl={profile.imageUrl}
+              name={name}
+              size="profile"
+            />
+
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="rounded-full border border-brand/25 bg-brand/10 px-2.5 py-1 text-[0.68rem] font-semibold uppercase tracking-[0.08em] text-brand">
+                  {formatChainName(profile.chainId)}
+                </span>
+                <span className="rounded-full border border-border bg-background/60 px-2.5 py-1 text-[0.68rem] font-semibold text-muted-foreground">
+                  ERC-8004 #{profile.agentId}
+                </span>
+              </div>
+
+              <h1 className="mt-4 text-balance text-3xl font-semibold tracking-[-0.04em] text-foreground sm:text-4xl">
+                {name}
+              </h1>
+              <div className="mt-3 flex flex-wrap items-center gap-2.5">
+                <span
+                  className={cn(
+                    "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[0.68rem] font-semibold",
+                    profile.metadataStatus === "valid"
+                      ? "border-emerald-400/25 bg-emerald-400/8 text-emerald-200"
+                      : "border-amber-400/25 bg-amber-400/8 text-amber-100",
+                  )}
+                >
+                  {profile.metadataStatus === "valid" ? (
+                    <BadgeCheck className="size-3.5" aria-hidden="true" />
+                  ) : (
+                    <CircleAlert className="size-3.5" aria-hidden="true" />
+                  )}
+                  {formatMetadataStatus(profile.metadataStatus)}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex shrink-0 flex-wrap items-center gap-2 lg:justify-end">
+            <BookmarkToggle agent={profile} />
+            {canUseAgent ? (
+              <Link
+                href={`/start/${profile.chainId}/${profile.agentId}`}
+                className={cn(buttonVariants({ variant: "brand" }), "gap-2")}
+              >
+                <BriefcaseBusiness className="size-3.5" aria-hidden="true" />
+                Hire agent
+              </Link>
+            ) : null}
+            <ComparisonToggle
+              goal={comparisonGoal}
+              reference={{
+                agentId: profile.agentId,
+                chainId: profile.chainId,
+              }}
+            />
+            {registryHref ? (
+              <a
+                href={registryHref}
+                target="_blank"
+                rel="noreferrer noopener"
+                className={cn(buttonVariants({ variant: "outline" }), "gap-2")}
+              >
+                BscScan
+                <ExternalLink className="size-3.5" aria-hidden="true" />
+              </a>
+            ) : null}
+          </div>
+        </div>
+
+        <dl className="mt-7 grid gap-px overflow-hidden rounded-xl border border-border bg-border md:grid-cols-3">
+          <EvidenceStat
+            icon={
+              <Gauge
+                className="size-4 translate-y-px text-brand"
+                aria-hidden="true"
+              />
+            }
+            label={
+              <>
+                Sift Score
+                <ScoreCriteriaTooltip components={rating.components} />
+              </>
+            }
+            value={
+              <>
+                <AnimatedRatingValue value={rating.value} />/100
+              </>
+            }
+            detail={ratingDetail}
+          />
+          <EvidenceStat
+            icon={<RadioTower className="size-4 text-sky-300" aria-hidden="true" />}
+            label="Health"
+            value={healthPresentation.label}
+            detail={healthPresentation.detail}
+          />
+          <EvidenceStat
+            icon={<BriefcaseBusiness className="size-4 text-violet-300" aria-hidden="true" />}
+            label="Task access"
+            value={
+              taskReady
+                ? "Available"
+                : externalReady
+                  ? "External access"
+                  : "Unavailable"
+            }
+            detail={
+              taskReady
+                ? `${taskServices.length} recently checked ${taskServices.length === 1 ? "method" : "methods"}`
+                : externalReady
+                  ? `${externalServices.length} published external ${externalServices.length === 1 ? "service" : "services"}`
+                  : "No supported service has a current successful check"
+            }
+          />
+        </dl>
+
+        <div
+          className={cn(
+            "mt-4 flex flex-col gap-3 rounded-xl border px-4 py-3 sm:flex-row sm:items-center",
+            provenanceToneStyles[provenance.tone],
+          )}
+        >
+          <Clock3 className="size-4 shrink-0" aria-hidden="true" />
+          <div className="min-w-0 flex-1">
+            <p className="text-xs font-semibold">{provenance.label}</p>
+            <p className="mt-0.5 text-xs leading-5 opacity-75">
+              {provenance.description}
+            </p>
+          </div>
+          <p className="shrink-0 text-xs opacity-75">
+            Updated {formatProfileTimestamp(profile.lastSyncedAt)}
+          </p>
+        </div>
+
+        <div
+          id="hiring-availability"
+          className="mt-4 scroll-mt-24 rounded-xl border border-border bg-background/55 px-4 py-3 text-xs leading-5 text-muted-foreground"
+        >
+          <span className="font-semibold text-foreground">Hiring availability: </span>
+          {hireable
+            ? `This profile lists supported hiring on ${formatChainName(profile.chainId)}. Sift will check the live service and signed price before you can pay.`
+            : taskReady
+              ? `This agent can be used through ${taskServices.map((service) => service.activationMethod ? formatActivationMethod(service.activationMethod) : "a checked service").join(", ")}. It has not published a compatible protected-hiring service.`
+              : externalReady
+                ? "This agent publishes external services. Sift can open them, but their permissions and payments are controlled by the external provider."
+                : hiring.explanation}
+        </div>
+      </div>
+    </header>
+  );
+}

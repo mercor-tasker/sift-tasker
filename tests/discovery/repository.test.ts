@@ -1,0 +1,596 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+
+import type { SupabaseClient } from "@supabase/supabase-js";
+
+import type { Database, Json } from "../../lib/db/database.types";
+import { createDiscoveryRepository } from "../../lib/db/discovery-repository";
+import { parseDiscoverySearchParams } from "../../features/discovery/query";
+
+type SearchAgentRow = Readonly<{
+  active: boolean | null;
+  agent_db_id: string;
+  agent_id: string;
+  category_evidence: Json;
+  category_source: string | null;
+  chain_id: number;
+  description: string | null;
+  has_more: boolean;
+  image_url: string | null;
+  last_synced_at: string | null;
+  metadata_status: string;
+  name: string | null;
+  owner_address: string | null;
+  registered_at: string | null;
+  registered_block: number | null;
+  registry_address: string;
+  relevance: number;
+  resolved_categories: string[];
+  result_page: number;
+  services: Json;
+  x402_supported: boolean | null;
+}>;
+
+const fixtureRows: readonly SearchAgentRow[] = [
+  {
+    active: null,
+    agent_db_id: "11111111-1111-4111-8111-111111111111",
+    agent_id: "104",
+    category_evidence: [
+      {
+        category: "grid-trading",
+        confidence: 0.65,
+        facts: [],
+        matchedTerms: ["grid strategy"],
+        observedAt: "2026-08-22T09:00:00.000Z",
+        ruleVersion: "sift-category-taxonomy-v1.0.0",
+        source: "deterministic-rule",
+      },
+    ],
+    category_source: "deterministic-rule",
+    chain_id: 56,
+    description: "Fixture grid strategy metadata",
+    has_more: true,
+    image_url: null,
+    last_synced_at: "2026-08-22T09:00:00.000Z",
+    metadata_status: "valid",
+    name: "Fixture Grid Agent",
+    owner_address: "0x1111111111111111111111111111111111111111",
+    registered_at: "2026-08-20T09:00:00.000Z",
+    registered_block: 120,
+    registry_address: "0x8004a818bfb912233c491871b3d84c89a494bd9e",
+    relevance: 0.8,
+    resolved_categories: ["grid-trading"],
+    result_page: 2,
+    services: [{ endpoint: null, serviceType: "A2A", version: "1.0" }],
+    x402_supported: null,
+  },
+  {
+    active: null,
+    agent_db_id: "22222222-2222-4222-8222-222222222222",
+    agent_id: "103",
+    category_source: null,
+    category_evidence: [],
+    chain_id: 56,
+    description: null,
+    has_more: true,
+    image_url: null,
+    last_synced_at: "2026-08-22T09:00:00.000Z",
+    metadata_status: "invalid",
+    name: null,
+    owner_address: null,
+    registered_at: "2026-08-19T09:00:00.000Z",
+    registered_block: 119,
+    registry_address: "0x8004a818bfb912233c491871b3d84c89a494bd9e",
+    relevance: 0.4,
+    resolved_categories: [],
+    result_page: 2,
+    services: [],
+    x402_supported: null,
+  },
+];
+
+const noEvidence = {
+  listHealth: async () => [],
+  listScores: async () => [],
+  listServices: async () => [],
+};
+
+function agentDetails(rows: readonly SearchAgentRow[]) {
+  return rows.map((row) => ({
+    active: row.active,
+    agent_category_evidence: Array.isArray(row.category_evidence)
+      ? row.category_evidence.map((evidence) => ({
+          category:
+            typeof evidence === "object" &&
+            evidence !== null &&
+            !Array.isArray(evidence) &&
+            "category" in evidence
+              ? evidence.category
+              : null,
+          confidence: 0.65,
+          evidence: { matchedTerms: ["grid strategy"] },
+          facts: [],
+          observed_at: "2026-08-22T09:00:00.000Z",
+          rule_version: "sift-category-taxonomy-v1.0.0",
+          source: "deterministic-rule",
+        }))
+      : [],
+    agent_id: row.agent_id,
+    agent_services: Array.isArray(row.services)
+      ? row.services.flatMap((service) =>
+          typeof service === "object" &&
+          service !== null &&
+          !Array.isArray(service) &&
+          "serviceType" in service &&
+          typeof service.serviceType === "string"
+            ? [{
+                service_type: service.serviceType,
+                version:
+                  "version" in service && typeof service.version === "string"
+                    ? service.version
+                    : null,
+              }]
+            : [],
+        )
+      : [],
+    chain_id: row.chain_id,
+    description: row.description,
+    id: row.agent_db_id,
+    image_url: row.image_url,
+    last_synced_at: row.last_synced_at,
+    metadata_status: row.metadata_status,
+    metadata_verified_at: row.last_synced_at,
+    name: row.name,
+    owner_address: row.owner_address,
+    registered_at: row.registered_at,
+    registered_block: row.registered_block,
+    registry_address: row.registry_address,
+    x402_supported: row.x402_supported,
+  }));
+}
+
+function keyRows(rows: readonly SearchAgentRow[]) {
+  return rows.map((row) => ({
+    agent_db_id: row.agent_db_id,
+    has_more: row.has_more,
+    result_page: row.result_page,
+  }));
+}
+
+function hydrationSource(
+  calls: unknown[],
+  rows: readonly SearchAgentRow[],
+) {
+  return {
+    from(table: string) {
+      calls.push({ operation: "from", table });
+      return {
+        select() {
+          return {
+            async in(column: string, values: readonly string[]) {
+              calls.push({ column, operation: "in", values });
+              return { data: agentDetails(rows), error: null };
+            },
+          };
+        },
+      };
+    },
+  };
+}
+
+describe("discovery repository integration boundary", () => {
+  it("uses a bounded indexed table path for the unfiltered recent catalogue", async () => {
+    const calls: unknown[] = [];
+    const recentRow = {
+      active: true,
+      agent_category_evidence: [
+        {
+          category: "grid-trading",
+          confidence: 0.65,
+          evidence: { matchedTerms: ["grid strategy"] },
+          facts: [],
+          observed_at: "2026-09-05T09:00:00.000Z",
+          rule_version: "sift-category-taxonomy-v1.0.0",
+          source: "deterministic-rule",
+        },
+      ],
+      agent_id: "205",
+      agent_services: [{ service_type: "A2A", version: "1.0" }],
+      chain_id: 56,
+      description: "Fixture latest registration",
+      id: "33333333-3333-4333-8333-333333333333",
+      image_url: null,
+      last_synced_at: "2026-09-05T09:00:00.000Z",
+      metadata_status: "valid",
+      name: "Fixture Latest Agent",
+      owner_address: "0x3333333333333333333333333333333333333333",
+      registered_at: "2026-09-05T08:59:00.000Z",
+      registered_block: 205,
+      registry_address: "0x8004a169fb4a3325136eb29fa0ceb6d2e539a432",
+      x402_supported: false,
+    };
+    const request = {
+      eq(column: string, value: unknown) {
+        calls.push({ column, operation: "eq", value });
+        return request;
+      },
+      in(column: string, value: unknown) {
+        calls.push({ column, operation: "in", value });
+        return request;
+      },
+      order(column: string, options: unknown) {
+        calls.push({ column, operation: "order", options });
+        return request;
+      },
+      async range(from: number, to: number) {
+        calls.push({ from, operation: "range", to });
+        return { data: [recentRow], error: null };
+      },
+      select() {
+        calls.push({ operation: "select" });
+        return request;
+      },
+    };
+    const client = {
+      from(table: string) {
+        calls.push({ operation: "from", table });
+        return request;
+      },
+      async rpc() {
+        throw new Error("The recent fast path must not call search_agents.");
+      },
+    } as unknown as SupabaseClient<Database>;
+
+    const result = await createDiscoveryRepository(
+      client,
+      noEvidence,
+    ).listRecentlyRegistered();
+
+    assert.equal(result.agents.length, 1);
+    assert.equal(result.agents[0]?.agentId, "205");
+    assert.deepEqual(result.agents[0]?.categories, ["grid-trading"]);
+    assert.deepEqual(result.agents[0]?.services, [
+      { endpoint: null, serviceType: "A2A", version: "1.0" },
+    ]);
+    assert.deepEqual(calls.slice(0, 3), [
+      { operation: "from", table: "agents" },
+      { operation: "select" },
+      { column: "chain_id", operation: "eq", value: 56 },
+    ]);
+    assert.deepEqual(calls.at(-1), {
+      from: 0,
+      operation: "range",
+      to: 12,
+    });
+  });
+
+  it("passes validated combined filters to the database function", async () => {
+    const calls: unknown[] = [];
+    const client = {
+      ...hydrationSource(calls, fixtureRows),
+      async rpc(name: string, parameters: unknown) {
+        calls.push({ name, parameters });
+        return { data: keyRows(fixtureRows), error: null };
+      },
+    } as unknown as SupabaseClient<Database>;
+    const query = parseDiscoverySearchParams({
+      category: "grid-trading",
+      metadata: ["valid", "invalid"],
+      page: "2",
+      q: "automate grid trading",
+      size: "12",
+      sort: "recent",
+    });
+
+    const result = await createDiscoveryRepository(client, noEvidence).search(query);
+
+    assert.deepEqual(calls[0], {
+      name: "search_agent_discovery_keys",
+      parameters: {
+        p_categories: ["grid-trading"],
+        p_chain_ids: [56],
+        p_health_statuses: [],
+        p_metadata_statuses: ["valid", "invalid"],
+        p_page: 2,
+        p_page_size: 12,
+        p_ready_only: false,
+        p_registration_period: null,
+        p_score_bands: [],
+        p_search_terms: ["automate", "grid", "trading"],
+        p_sort: "recent",
+      },
+    });
+    assert.equal(result.hasNextPage, true);
+    assert.equal(result.totalCount, null);
+    assert.equal(result.page, 2);
+  });
+
+  it("uses the health-aware database function when health is filtered", async () => {
+    const calls: unknown[] = [];
+    const client = {
+      ...hydrationSource(calls, fixtureRows),
+      async rpc(name: string, parameters: unknown) {
+        calls.push({ name, parameters });
+        return { data: keyRows(fixtureRows), error: null };
+      },
+    } as unknown as SupabaseClient<Database>;
+    const query = parseDiscoverySearchParams({
+      health: ["online", "unknown", "unsupported"],
+      metadata: "valid",
+    });
+
+    await createDiscoveryRepository(client, noEvidence).search(query);
+
+    assert.deepEqual(calls[0], {
+      name: "search_agent_discovery_keys",
+      parameters: {
+        p_categories: [],
+        p_chain_ids: [56],
+        p_health_statuses: ["online", "unknown"],
+        p_metadata_statuses: ["valid"],
+        p_page: 1,
+        p_page_size: 12,
+        p_ready_only: false,
+        p_registration_period: null,
+        p_score_bands: [],
+        p_search_terms: [],
+        p_sort: "recent",
+      },
+    });
+  });
+
+  it("uses bounded keys for registration and decision sorts", async () => {
+    const calls: unknown[] = [];
+    const client = {
+      from(table: string) {
+        calls.push({ operation: "from", table });
+        return {
+          select() {
+            return {
+              async in() {
+                return { data: [], error: null };
+              },
+            };
+          },
+        };
+      },
+      async rpc(name: string, parameters: unknown) {
+        calls.push({ name, parameters });
+        return {
+          data: [
+            {
+              agent_db_id: fixtureRows[0]!.agent_db_id,
+              has_more: false,
+              result_page: 1,
+            },
+          ],
+          error: null,
+        };
+      },
+    } as unknown as SupabaseClient<Database>;
+    const query = parseDiscoverySearchParams({
+      availability: "ready",
+      health: "online",
+      registered: "month",
+      sort: "services-desc",
+    });
+
+    await createDiscoveryRepository(client, noEvidence).search(query);
+
+    assert.deepEqual(calls[0],
+      {
+        name: "search_agent_discovery_keys",
+        parameters: {
+          p_categories: [],
+          p_chain_ids: [56],
+          p_health_statuses: ["online"],
+          p_metadata_statuses: [],
+          p_page: 1,
+          p_page_size: 12,
+          p_ready_only: true,
+          p_registration_period: "month",
+          p_score_bands: [],
+          p_search_terms: [],
+          p_sort: "services-desc",
+        },
+      },
+    );
+  });
+
+  it("loads only the bounded agent page selected by the rating function", async () => {
+    const calls: unknown[] = [];
+    const agentDetails = fixtureRows.map((row) => ({
+      active: row.active,
+      agent_category_evidence: Array.isArray(row.category_evidence)
+        ? row.category_evidence.map((evidence) => ({
+            category:
+              typeof evidence === "object" &&
+              evidence !== null &&
+              !Array.isArray(evidence) &&
+              "category" in evidence
+                ? evidence.category
+                : null,
+            confidence: 0.65,
+            evidence: { matchedTerms: ["grid strategy"] },
+            facts: [],
+            observed_at: "2026-08-22T09:00:00.000Z",
+            rule_version: "sift-category-taxonomy-v1.0.0",
+            source: "deterministic-rule",
+          }))
+        : [],
+      agent_id: row.agent_id,
+      agent_services: [],
+      chain_id: row.chain_id,
+      description: row.description,
+      id: row.agent_db_id,
+      image_url: row.image_url,
+      last_synced_at: row.last_synced_at,
+      metadata_status: row.metadata_status,
+      name: row.name,
+      owner_address: row.owner_address,
+      registered_at: row.registered_at,
+      registered_block: row.registered_block,
+      registry_address: row.registry_address,
+      x402_supported: row.x402_supported,
+    }));
+    const client = {
+      from(table: string) {
+        calls.push({ table, operation: "from" });
+        return {
+          select() {
+            calls.push({ operation: "select" });
+            return {
+              async in(column: string, values: readonly string[]) {
+                calls.push({ column, operation: "in", values });
+                return { data: agentDetails, error: null };
+              },
+            };
+          },
+        };
+      },
+      async rpc(name: string, parameters: unknown) {
+        calls.push({ name, parameters });
+        return {
+          data: [
+            {
+              agent_db_id: fixtureRows[1]!.agent_db_id,
+              has_more: true,
+              result_page: 2,
+            },
+            {
+              agent_db_id: fixtureRows[0]!.agent_db_id,
+              has_more: true,
+              result_page: 2,
+            },
+          ],
+          error: null,
+        };
+      },
+    } as unknown as SupabaseClient<Database>;
+    const query = parseDiscoverySearchParams({
+      availability: "ready",
+      health: "online",
+      page: "2",
+      rating: ["excellent", "good"],
+      registered: "month",
+      sort: "services-desc",
+    });
+
+    const result = await createDiscoveryRepository(client, noEvidence).search(query);
+
+    assert.deepEqual(calls[0], {
+      name: "search_agent_discovery_keys",
+      parameters: {
+        p_categories: [],
+        p_chain_ids: [56],
+        p_health_statuses: ["online"],
+        p_metadata_statuses: [],
+        p_page: 2,
+        p_page_size: 12,
+        p_ready_only: true,
+        p_registration_period: "month",
+        p_score_bands: ["excellent", "good"],
+        p_search_terms: [],
+        p_sort: "services-desc",
+      },
+    });
+    assert.deepEqual(calls.at(-1), {
+      column: "id",
+      operation: "in",
+      values: [fixtureRows[1]!.agent_db_id, fixtureRows[0]!.agent_db_id],
+    });
+    assert.deepEqual(
+      result.agents.map((agent) => agent.agentId),
+      ["103", "104"],
+    );
+    assert.equal(result.hasNextPage, true);
+    assert.equal(result.page, 2);
+  });
+
+  it("delegates current task availability and pagination to one bounded RPC", async () => {
+    const calls: Readonly<{ name: string; parameters: unknown }>[] = [];
+    const firstBatch = Array.from({ length: 12 }, (_, index) => ({
+      ...fixtureRows[0]!,
+      agent_db_id: `10000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+      agent_id: String(100 + index),
+      has_more: true,
+      result_page: 1,
+      services: [
+        { endpoint: null, serviceType: "ERC-8183", version: "1.0" },
+      ],
+    }));
+    const client = {
+      ...hydrationSource(calls, firstBatch),
+      async rpc(
+        name: string,
+        parameters: unknown,
+      ) {
+        calls.push({ name, parameters });
+        return {
+          data: keyRows(firstBatch),
+          error: null,
+        };
+      },
+    } as unknown as SupabaseClient<Database>;
+    const query = parseDiscoverySearchParams({
+      availability: "ready",
+      network: "all",
+      q: "protocol",
+      size: "12",
+    });
+
+    const result = await createDiscoveryRepository(client, noEvidence).search(
+      query,
+    );
+
+    assert.deepEqual(calls[0], {
+      name: "search_agent_discovery_keys",
+      parameters: {
+        p_categories: [],
+        p_chain_ids: [56],
+        p_health_statuses: [],
+        p_metadata_statuses: [],
+        p_page: 1,
+        p_page_size: 12,
+        p_ready_only: true,
+        p_registration_period: null,
+        p_score_bands: [],
+        p_search_terms: ["protocol"],
+        p_sort: "relevance",
+      },
+    });
+    assert.equal(result.agents.length, 12);
+    assert.equal(result.agents[0]?.agentId, "100");
+    assert.equal(result.agents.at(-1)?.agentId, "111");
+    assert.equal(result.hasNextPage, true);
+    assert.equal(result.page, 1);
+  });
+
+  it("preserves stable database order and maps service/category fixtures", async () => {
+    const calls: unknown[] = [];
+    const client = {
+      ...hydrationSource(calls, fixtureRows),
+      async rpc() {
+        return { data: keyRows(fixtureRows), error: null };
+      },
+    } as unknown as SupabaseClient<Database>;
+    const query = parseDiscoverySearchParams({ q: "grid" });
+
+    const result = await createDiscoveryRepository(client, noEvidence).search(query);
+
+    assert.deepEqual(
+      result.agents.map((agent) => agent.agentId),
+      ["104", "103"],
+    );
+    assert.deepEqual(result.agents[0]?.categories, ["grid-trading"]);
+    assert.deepEqual(result.agents[0]?.services, [
+      {
+        endpoint: null,
+        serviceType: "A2A",
+        version: "1.0",
+      },
+    ]);
+    assert.equal(result.agents[1]?.name, null);
+  });
+});

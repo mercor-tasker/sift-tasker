@@ -1,0 +1,69 @@
+import { cookies } from "next/headers";
+import { getAddress, isAddress } from "viem";
+
+import { DASHBOARD_SESSION_COOKIE } from "@/features/dashboard/session";
+import { isHiringChainId } from "@/features/hiring/protocol";
+import { getWalletDashboard } from "@/features/dashboard/service";
+import { getDashboardSession } from "@/lib/db/dashboard-session-repository";
+import {
+  checkApiRateLimit,
+  isSameOriginRequest,
+  rateLimitResponse,
+} from "@/lib/security/api-request";
+
+export const runtime = "nodejs";
+
+function json(body: unknown, status = 200): Response {
+  return Response.json(body, {
+    status,
+    headers: { "cache-control": "no-store" },
+  });
+}
+
+export async function GET(request: Request): Promise<Response> {
+  if (!isSameOriginRequest(request, { allowMissingOrigin: true })) {
+    return json({ error: "Cross-site dashboard requests are not allowed." }, 403);
+  }
+
+  const rateLimit = checkApiRateLimit(request, {
+    capacity: 30,
+    namespace: "dashboard:read",
+    windowMs: 60_000,
+  });
+  if (!rateLimit.allowed) return rateLimitResponse(rateLimit);
+
+  try {
+    const requestedWallet = request.headers.get("x-sift-wallet-address");
+    const requestedChainId = Number(request.headers.get("x-sift-chain-id"));
+    if (
+      !requestedWallet ||
+      !isAddress(requestedWallet) ||
+      !isHiringChainId(requestedChainId)
+    ) {
+      return json({ error: "A connected wallet is required." }, 401);
+    }
+    const sessionToken = (await cookies()).get(DASHBOARD_SESSION_COOKIE)?.value;
+    const session = await getDashboardSession(sessionToken ?? null);
+    if (
+      !session ||
+      session.walletAddress !== getAddress(requestedWallet) ||
+      session.chainId !== requestedChainId
+    ) {
+      return json({ error: "Verify the connected wallet to view its dashboard." }, 401);
+    }
+
+    const dashboard = await getWalletDashboard(
+      session.walletAddress,
+      session.chainId,
+    );
+    return json({ dashboard, session });
+  } catch (error) {
+    console.error("[dashboard] load failed", {
+      error: error instanceof Error ? error.name : "UnknownError",
+    });
+    return json(
+      { error: "Task records could not be loaded." },
+      500,
+    );
+  }
+}

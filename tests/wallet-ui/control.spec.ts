@@ -1,0 +1,91 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+
+import {
+  WalletControlView,
+  type WalletConnectionView,
+} from "../../components/wallet/wallet-control-view";
+import { mapWalletError } from "../../features/wallet/presentation";
+
+function render(view: WalletConnectionView, mobile = false): string {
+  return renderToStaticMarkup(
+    createElement(WalletControlView, {
+      mobile,
+      onConnect() {},
+      onDisconnect() {},
+      onDismissNotice() {},
+      onOpenChain() {},
+      view,
+    }),
+  );
+}
+
+describe("wallet connection control states", () => {
+  it("keeps the server/hydration shell stable and disconnected browsing enabled", () => {
+    const hydrating = render({ connection: "hydrating" });
+    const disconnected = render({
+      connection: "disconnected",
+      providerAvailable: true,
+    });
+
+    assert.match(hydrating, /Loading wallet connection/);
+    assert.match(hydrating, /Connect Wallet/);
+    assert.match(disconnected, /Connect Wallet/);
+  });
+
+  it("renders connecting and reconnecting states plainly", () => {
+    assert.match(render({ connection: "connecting" }), /Connecting/);
+    assert.match(render({ connection: "reconnecting" }), /Reconnecting/);
+  });
+
+  it("shows the actual shortened account in the wallet menu", () => {
+    const html = render({
+      addressLabel: "0x1234…5678",
+      balanceLabel: "1.25 BNB",
+      chainName: "BSC Mainnet",
+      connection: "connected",
+      supportedChain: true,
+      walletName: "Browser wallet",
+    });
+
+    assert.match(html, /0x1234…5678/);
+    assert.match(html, /Open wallet menu/);
+  });
+
+  it("offers an explicit supported-network chooser", () => {
+    assert.match(
+      render({
+        chainName: "Ethereum",
+        connection: "connected",
+        supportedChain: false,
+      }),
+      /Choose a BNB network/,
+    );
+  });
+
+  it("renders rejected and provider-unavailable guidance on mobile", () => {
+    const rejected = render(
+      {
+        connection: "disconnected",
+        notice: mapWalletError({ code: 4001 }),
+        providerAvailable: true,
+      },
+      true,
+    );
+    const unavailable = render(
+      {
+        connection: "disconnected",
+        notice: mapWalletError({ name: "ProviderNotFoundError" }),
+        providerAvailable: false,
+      },
+      true,
+    );
+
+    assert.match(rejected, /Request cancelled/);
+    assert.match(rejected, /Nothing was signed or submitted/);
+    assert.match(unavailable, /Wallet unavailable/);
+    assert.match(unavailable, /Install or unlock a supported wallet/);
+  });
+});

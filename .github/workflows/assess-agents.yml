@@ -1,0 +1,68 @@
+name: Assess agent health and scores
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "47 */6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sift-agent-assessment
+  cancel-in-progress: false
+
+jobs:
+  assess:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HEALTH_CHECK_CONCURRENCY: ${{ vars.HEALTH_CHECK_CONCURRENCY || '3' }}
+      HEALTH_CHECK_INTERVAL_HOURS: ${{ vars.HEALTH_CHECK_INTERVAL_HOURS || '6' }}
+      HEALTH_CHECK_LIMIT: ${{ vars.HEALTH_CHECK_LIMIT || '50' }}
+      ACTIVATION_CHECK_CONCURRENCY: ${{ vars.ACTIVATION_CHECK_CONCURRENCY || '3' }}
+      ACTIVATION_CHECK_INTERVAL_HOURS: ${{ vars.ACTIVATION_CHECK_INTERVAL_HOURS || '6' }}
+      # The checker remains capped at 100, uses three concurrent requests, and
+      # revalidates every target before persisting evidence.
+      ACTIVATION_CHECK_LIMIT: ${{ vars.ACTIVATION_CHECK_LIMIT || '100' }}
+      SCORE_BATCH_LIMIT: ${{ vars.SCORE_BATCH_LIMIT || '500' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          cache: npm
+          node-version: 22
+
+      - name: Use repository npm version
+        run: npm install --global npm@11.6.1
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check bounded eligible endpoints
+        run: npm run check:agents
+        env:
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+
+      - name: Check declared task services
+        run: npm run check:activation
+        env:
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+
+      - name: Recalculate affected Sift Scores
+        run: npm run score:agents
+        env:
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+
+      - name: Refresh bounded 8004scan shortlist cross-checks
+        run: npm run enrich:categories
+        env:
+          SIFT_8004SCAN_API_KEY: ${{ secrets.SIFT_8004SCAN_API_KEY }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
